@@ -17,6 +17,8 @@ class RefreshSheetArbitrationConfig {
     this.minStraightness = 0.85,
     this.reversalHysteresis = 8.0,
     this.velocityHoldOff = const Duration(milliseconds: 40),
+    this.takeoverDeadline = const Duration(milliseconds: 200),
+    this.refreshCanBecomeDismiss = false,
     this.minRunForVelocity = 32.0,
     this.dismissVelocityTop = 1100.0,
     this.dismissVelocityBody = 800.0,
@@ -48,6 +50,15 @@ class RefreshSheetArbitrationConfig {
 
   /// No velocity decision before this much time since pointer down.
   final Duration velocityHoldOff;
+
+  /// No takeover after this much time since pointer down: a pull the
+  /// indicator has been tracking stays with the indicator, however it speeds
+  /// up. A dismiss flick starts moving right after the finger lands.
+  final Duration takeoverDeadline;
+
+  /// When true, a pull the indicator is tracking (armed or past
+  /// [takeoverDeadline]) still hands over to the sheet if it turns fast.
+  final bool refreshCanBecomeDismiss;
 
   /// No velocity decision before the run is this long, in px.
   final double minRunForVelocity;
@@ -349,7 +360,7 @@ class RefreshSheetArbitrator {
   /// One line with every input the takeover decision reads.
   String describe() {
     final Offset run = _last - _runStart;
-    return 'state=${state.name}${_armed ? '(armed)' : ''} pull=${pull.toStringAsFixed(1)} '
+    return 't=${(_lastTime - _downTime).inMilliseconds}ms state=${state.name}${_armed ? '(armed)' : ''} pull=${pull.toStringAsFixed(1)} '
         'sheet=${sheetOffset.toStringAsFixed(1)} vSmooth=${_smoothedVy.toStringAsFixed(0)} '
         'vInst=${_instantVy.toStringAsFixed(0)} run=${run.dy.toStringAsFixed(1)}/${run.dx.toStringAsFixed(1)} '
         'straight=${_straightness.toStringAsFixed(2)} flips=${_flips.length} '
@@ -373,8 +384,13 @@ class RefreshSheetArbitrator {
       _runPath == 0.0 ? 1.0 : (_last - _runStart).distance / _runPath;
 
   bool _dismissIntent() {
-    // Armed means committed to refresh: no speed-up hands it to the sheet.
-    if (!_sheetEnabled || _armed || _multiTouch || _runDir <= 0) {
+    // Armed, or tracked past the deadline, means committed to the indicator.
+    final bool committed =
+        _armed || _lastTime - _downTime > config.takeoverDeadline;
+    if (!_sheetEnabled ||
+        (committed && !config.refreshCanBecomeDismiss) ||
+        _multiTouch ||
+        _runDir <= 0) {
       return false;
     }
     final Offset run = _last - _runStart;

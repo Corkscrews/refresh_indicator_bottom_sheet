@@ -14,7 +14,9 @@ class _Trace {
     bool eligible = true,
     bool refreshing = false,
     bool sheetEnabled = true,
-  }) {
+    RefreshSheetArbitrationConfig config =
+        const RefreshSheetArbitrationConfig(),
+  }) : arb = RefreshSheetArbitrator(config: config) {
     arb.pointerDown(1, _t, _at, Offset(200.0, localY), PointerDeviceKind.touch);
     arb.beginDrag(
       eligible: eligible,
@@ -26,7 +28,7 @@ class _Trace {
     );
   }
 
-  final arb = RefreshSheetArbitrator();
+  final RefreshSheetArbitrator arb;
   Duration _t = Duration.zero;
   Offset _at = const Offset(200.0, 300.0);
   double room = 0.0; // list pixels above its top
@@ -103,6 +105,31 @@ void main() {
     expect(trace.arb.sheetOffset, 0.0);
     expect(trace.release(2500.0), ArbitrationCommit.refresh);
   });
+
+  testWidgets('a slow pull that turns fast stays on the indicator', (_) async {
+    // The device trace: a slow pull to well below the arm distance, then a
+    // flick. Only the deadline stops it, the pull never arms in time.
+    final trace = _Trace()..move(4, 5.0, ms: 100); // 20 px over 400 ms
+    trace.move(5, 15.0, ms: 8); // 1875 px/s, pull 95 < arm
+    expect(trace.arb.armed, isFalse);
+    expect(trace.arb.state, ArbitrationState.indicator);
+    expect(trace.arb.sheetOffset, 0.0);
+  });
+
+  testWidgets(
+    'refreshCanBecomeDismiss lets an armed pull turn into a dismiss',
+    (_) async {
+      final trace = _Trace(
+        config: const RefreshSheetArbitrationConfig(
+          refreshCanBecomeDismiss: true,
+        ),
+      )..move(22, 5.0); // 110 px over 352 ms: armed and past the deadline
+      expect(trace.arb.armed, isTrue);
+      trace.move(5, 40.0); // 2500 px/s
+      expect(trace.arb.state, ArbitrationState.sheet);
+      expect(trace.release(2500.0), ArbitrationCommit.close);
+    },
+  );
 
   testWidgets('reversal unwinds sheet, then indicator, then scrolls the list', (
     _,
