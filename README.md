@@ -6,6 +6,12 @@ Put a scrollable list in a modal bottom sheet. Add pull-to-refresh. Now try to s
 
 You can't. Or you can refresh but not dismiss, or dismiss but not refresh. Nobody gets both. This package is my attempt to make the same downward pull do both, and to make it feel right.
 
+## Demo
+
+A slow pull from the top refreshes. A fast pull dismisses the sheet. Reversing mid-gesture hands the finger back.
+
+https://github.com/user-attachments/assets/6bb81126-f2f4-4132-8426-94fd5eec69a5
+
 ## Why this exists
 
 I keep running into this. Every few months I build a screen with a bottom sheet and a list, someone asks for pull-to-refresh, someone else asks that the sheet still closes with a swipe, and the answer is always some version of "pick one".
