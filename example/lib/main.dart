@@ -1,7 +1,17 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:refresh_indicator_bottom_sheet/refresh_indicator_bottom_sheet.dart';
+import 'package:refresh_indicator_bottom_sheet_example/debug_overlay.dart';
+import 'package:refresh_indicator_bottom_sheet_example/gesture_log.dart';
+import 'package:refresh_indicator_bottom_sheet_example/home_screen.dart';
 
 void main() {
+  debugRefreshSheetLogs = true; // the tuning overlay reads the [RSheet] lines
+  final DebugPrintCallback print = debugPrint;
+  debugPrint = (String? message, {int? wrapWidth}) {
+    if (message != null) gestureLog.add(message);
+    print(message, wrapWidth: wrapWidth);
+  };
   runApp(const ExampleApp());
 }
 
@@ -10,46 +20,10 @@ class ExampleApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(home: HomeScreen());
-  }
-}
-
-class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Refresh indicator')),
-      body: Center(
-        child: FilledButton(
-          onPressed: () {
-            showRefreshModalBottomSheet<void>(
-              context: context,
-              builder: (context) => const RefreshListSheet(),
-            );
-          },
-          child: const Text('Open bottom sheet'),
-        ),
-      ),
-    );
-  }
-}
-
-class RefreshListSheet extends StatelessWidget {
-  const RefreshListSheet({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return RefreshIndicatorOpt(
-      onRefresh: () => Future<void>.delayed(const Duration(seconds: 1)),
-      child: ListView.builder(
-        physics: const AlwaysScrollableScrollPhysics(),
-        itemCount: 30,
-        itemBuilder: (context, index) {
-          return ListTile(title: Text('Item ${index + 1}'));
-        },
-      ),
+    return MaterialApp(
+      home: const HomeScreen(),
+      builder: (context, child) =>
+          Stack(children: <Widget>[child!, const DebugOverlay()]),
     );
   }
 }

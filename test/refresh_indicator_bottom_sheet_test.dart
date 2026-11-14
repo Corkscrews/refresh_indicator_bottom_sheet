@@ -1,8 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:cupertino_ui/cupertino_ui.dart' show CupertinoActivityIndicator;
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride;
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:refresh_indicator_bottom_sheet/refresh_indicator_bottom_sheet.dart';
+import 'package:refresh_indicator_bottom_sheet/src/refresh_indicator_bottom_sheet.dart';
 
 final _platforms = TargetPlatformVariant(<TargetPlatform>{
   TargetPlatform.android,
@@ -16,9 +20,21 @@ class _Harness {
   int refreshes = 0;
   Completer<void>? pending;
 
-  Future<void> open(WidgetTester tester) async {
+  Future<void> open(
+    WidgetTester tester, {
+    bool reverse = false,
+    bool settle = true,
+    bool mouseDrags = false,
+    RefreshSheetArbitrationConfig arbitration =
+        const RefreshSheetArbitrationConfig(),
+  }) async {
     await tester.pumpWidget(
       MaterialApp(
+        scrollBehavior: mouseDrags
+            ? const MaterialScrollBehavior().copyWith(
+                dragDevices: PointerDeviceKind.values.toSet(),
+              )
+            : null,
         home: Builder(
           builder: (context) => Scaffold(
             body: Center(
@@ -26,11 +42,13 @@ class _Harness {
                 onPressed: () => showRefreshModalBottomSheet<void>(
                   context: context,
                   builder: (_) => RefreshIndicatorOpt(
+                    arbitration: arbitration,
                     onRefresh: () {
                       refreshes++;
                       return (pending = Completer<void>()).future;
                     },
                     child: ListView.builder(
+                      reverse: reverse,
                       physics: const AlwaysScrollableScrollPhysics(),
                       itemCount: 30,
                       itemBuilder: (_, i) =>
@@ -46,7 +64,7 @@ class _Harness {
       ),
     );
     await tester.tap(find.text('open'));
-    await tester.pumpAndSettle();
+    if (settle) await tester.pumpAndSettle();
   }
 
   Future<void> finishRefresh(WidgetTester tester) async {
@@ -61,7 +79,11 @@ double _sheetTop(WidgetTester tester) =>
 double _listOffset(WidgetTester tester) =>
     tester.state<ScrollableState>(find.byType(Scrollable).last).position.pixels;
 
-final _indicator = find.byType(RefreshProgressIndicator);
+// iOS draws a Cupertino spinner; Android keeps the Material ring.
+Finder get _indicator =>
+    debugDefaultTargetPlatformOverride == TargetPlatform.iOS
+    ? find.byType(CupertinoActivityIndicator)
+    : find.byType(RefreshProgressIndicator);
 
 /// [by] moves in 10 px steps, 50 ms apart (200 px/s): a soft pull.
 /// [fast] moves in 30 px steps, 16 ms apart (~1900 px/s).
@@ -72,9 +94,13 @@ class _Drag {
   final TestGesture gesture;
   var _time = Duration.zero;
 
-  static Future<_Drag> start(WidgetTester tester, String item) async => _Drag(
+  static Future<_Drag> start(
+    WidgetTester tester,
+    String item, {
+    PointerDeviceKind kind = PointerDeviceKind.touch,
+  }) async => _Drag(
     tester,
-    await tester.startGesture(tester.getCenter(find.text(item))),
+    await tester.startGesture(tester.getCenter(find.text(item)), kind: kind),
   );
 
   Future<void> by(double dy) async {
@@ -116,6 +142,39 @@ void main() {
     expect(find.byType(RefreshIndicator), findsOneWidget);
     expect(find.text('Item'), findsOneWidget);
   });
+
+  testWidgets('outside a sheet the spinner follows the platform', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RefreshIndicatorOpt(
+          onRefresh: () async {},
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: const [Text('Item')],
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text('Item')),
+    );
+    await gesture.moveBy(const Offset(0, 300));
+    await tester.pump();
+
+    final bool ios = debugDefaultTargetPlatformOverride == TargetPlatform.iOS;
+    expect(
+      find.byType(CupertinoActivityIndicator),
+      ios ? findsOneWidget : findsNothing,
+    );
+    expect(
+      find.byType(RefreshProgressIndicator),
+      ios ? findsNothing : findsOneWidget,
+    );
+    await gesture.up();
+  }, variant: _platforms);
 
   testWidgets('a soft short pull shows the indicator and leaves the sheet', (
     tester,
@@ -215,7 +274,12 @@ void main() {
     tester,
   ) async {
     final h = _Harness();
-    await h.open(tester);
+    await h.open(
+      tester,
+      arbitration: const RefreshSheetArbitrationConfig(
+        refreshCanBecomeDismiss: false,
+      ),
+    );
     final double openTop = _sheetTop(tester);
 
     final drag = await _Drag.start(tester, 'Item 2');
@@ -312,4 +376,108 @@ void main() {
     },
     variant: _platforms,
   );
+
+  testWidgets('a cancelled armed pull retracts without refreshing', (
+    tester,
+  ) async {
+    final h = _Harness();
+    await h.open(tester);
+
+    final drag = await _Drag.start(tester, 'Item 2');
+    await drag.by(120);
+    await drag.gesture.cancel();
+    await tester.pumpAndSettle();
+
+    expect(h.refreshes, 0);
+    expect(_indicator, findsNothing);
+  }, variant: _platforms);
+
+  testWidgets('a cancelled sheet drag past half springs back', (tester) async {
+    final h = _Harness();
+    await h.open(tester);
+    final double openTop = _sheetTop(tester);
+    final double height = tester.getSize(find.byType(BottomSheet)).height;
+
+    final drag = await _Drag.start(tester, 'Item 2');
+    await drag.fast(120);
+    await drag.by(height * 0.6);
+    await drag.gesture.cancel();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(BottomSheet), findsOneWidget);
+    expect(_sheetTop(tester), moreOrLessEquals(openTop, epsilon: 0.5));
+  }, variant: _platforms);
+
+  testWidgets('a pop while the sheet is dragged closes it', (tester) async {
+    final h = _Harness();
+    await h.open(tester);
+
+    final drag = await _Drag.start(tester, 'Item 2');
+    await drag.fast(120);
+    Navigator.of(tester.element(find.text('Item 2'))).pop();
+    await tester.pump();
+    await drag.by(30); // the finger keeps moving after the pop
+    await drag.up();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(BottomSheet), findsNothing);
+  }, variant: _platforms);
+
+  testWidgets('a reversed list is never arbitrated', (tester) async {
+    final h = _Harness();
+    await h.open(tester, reverse: true);
+    final double openTop = _sheetTop(tester);
+
+    final drag = await _Drag.start(tester, 'Item 2');
+    await drag.by(-140); // toward the reversed list's start
+    expect(_indicator, findsNothing);
+    await drag.up();
+    await tester.pumpAndSettle();
+
+    expect(h.refreshes, 0);
+    expect(_sheetTop(tester), openTop);
+  }, variant: _platforms);
+
+  // Only reachable when the app lets a mouse drag scroll; by default the stock
+  // sheet's own recognizer takes mouse drags.
+  testWidgets('a mouse drag neither refreshes nor moves the sheet', (
+    tester,
+  ) async {
+    final h = _Harness();
+    await h.open(tester, mouseDrags: true);
+    final double openTop = _sheetTop(tester);
+
+    final drag = await _Drag.start(
+      tester,
+      'Item 2',
+      kind: PointerDeviceKind.mouse,
+    );
+    await drag.fast(120);
+    expect(_sheetTop(tester), openTop);
+    await drag.up();
+    await tester.pumpAndSettle();
+
+    expect(h.refreshes, 0);
+  }, variant: _platforms);
+
+  testWidgets('a slow pull during the entry animation never drags the sheet', (
+    tester,
+  ) async {
+    final h = _Harness();
+    await h.open(tester, settle: false);
+    await tester.pump(); // starts the entry animation
+    await tester.pump(const Duration(milliseconds: 50));
+
+    final drag = await _Drag.start(tester, 'Item 2');
+    var top = _sheetTop(tester);
+    for (var i = 0; i < 4; i++) {
+      await drag.by(10);
+      expect(_sheetTop(tester), lessThanOrEqualTo(top)); // still rising
+      top = _sheetTop(tester);
+    }
+    await drag.up();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(BottomSheet), findsOneWidget);
+  }, variant: _platforms);
 }

@@ -1,104 +1,12 @@
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 
-/// Every threshold the pull-to-refresh / drag-to-dismiss arbitration uses.
-///
-/// `V` is the list viewport height and `H` the sheet height. Values marked as
-/// hypotheses are starting points to be tuned by the experiments in
-/// docs/analysis/refresh-vs-dismiss-arbitration.md, section 7.
-@immutable
-class RefreshSheetArbitrationConfig {
-  const RefreshSheetArbitrationConfig({
-    this.edgeSlop = 1.0,
-    this.topBandFraction = 0.33,
-    this.axisDominance = 2.0,
-    this.minStraightness = 0.85,
-    this.reversalHysteresis = 8.0,
-    this.velocityHoldOff = const Duration(milliseconds: 40),
-    this.takeoverDeadline = const Duration(milliseconds: 200),
-    this.refreshCanBecomeDismiss = false,
-    this.minRunForVelocity = 32.0,
-    this.dismissVelocityTop = 1100.0,
-    this.dismissVelocityBody = 800.0,
-    this.instantVelocityFactor = 0.5,
-    this.jitterFlips = 2,
-    this.armDistanceFraction = 0.25,
-    this.armHysteresis = 12.0,
-    this.closeVelocity = 700.0,
-    this.closeProgress = 0.5,
-    this.indicatorTravelFactor = 1.5,
-    this.snapDuration = const Duration(milliseconds: 150),
-    this.retractDuration = const Duration(milliseconds: 200),
-  });
+import 'arbitration_config.dart';
+import 'debug_log.dart';
+import 'pointer_history.dart';
 
-  /// Px from the list's min extent that still counts as "at the top".
-  final double edgeSlop;
-
-  /// A pointer that lands in this top fraction of `V` uses the top thresholds.
-  final double topBandFraction;
-
-  /// The run is vertical when `|dy| >= axisDominance * |dx|`.
-  final double axisDominance;
-
-  /// Minimum net displacement / path length of the run.
-  final double minStraightness;
-
-  /// Px of opposite movement before a new run starts.
-  final double reversalHysteresis;
-
-  /// No velocity decision before this much time since pointer down.
-  final Duration velocityHoldOff;
-
-  /// No takeover after this much time since pointer down: a pull the
-  /// indicator has been tracking stays with the indicator, however it speeds
-  /// up. A dismiss flick starts moving right after the finger lands.
-  final Duration takeoverDeadline;
-
-  /// When true, a pull the indicator is tracking (armed or past
-  /// [takeoverDeadline]) still hands over to the sheet if it turns fast.
-  final bool refreshCanBecomeDismiss;
-
-  /// No velocity decision before the run is this long, in px.
-  final double minRunForVelocity;
-
-  /// Smoothed downward px/s that hands an indicator pull to the sheet, top band.
-  final double dismissVelocityTop;
-
-  /// Same, for a pointer that landed below the top band.
-  final double dismissVelocityBody;
-
-  /// The last sample's velocity must be at least this fraction of the gate.
-  final double instantVelocityFactor;
-
-  /// This many direction flips within the velocity window means jitter; the
-  /// velocity gate is then ignored.
-  final int jitterFlips;
-
-  /// Pull that arms the refresh, as a fraction of `V`
-  /// (stock `_kDragContainerExtentPercentage`).
-  final double armDistanceFraction;
-
-  /// Px below the arm distance before an armed indicator disarms.
-  final double armHysteresis;
-
-  /// Downward release px/s that closes a dragged sheet (stock `_kMinFlingVelocity`).
-  final double closeVelocity;
-
-  /// Dragged fraction of `H` that closes on release (stock `_kCloseProgressThreshold`).
-  final double closeProgress;
-
-  /// Indicator travel at full pull, in (displacement + indicator size)
-  /// (stock `_kDragSizeFactorLimit`).
-  final double indicatorTravelFactor;
-
-  /// Indicator snap to its refresh position, and retract on cancel or takeover.
-  final Duration snapDuration;
-
-  /// Indicator exit after the refresh completes.
-  final Duration retractDuration;
-}
+export 'arbitration_config.dart';
 
 /// Who tracks the finger.
 enum ArbitrationState { idle, list, indicator, sheet }
@@ -106,8 +14,22 @@ enum ArbitrationState { idle, list, indicator, sheet }
 /// What a release commits to.
 enum ArbitrationCommit { list, retract, refresh, close, springBack }
 
-// VelocityTracker's horizon (gestures/velocity_tracker.dart).
-const Duration _kVelocityWindow = Duration(milliseconds: 100);
+/// Upper bound on state changes inside one delta; guards against cycling.
+const int _kMaxRouteHops = 8;
+
+/// A delta being split between the targets, one state change at a time.
+class _RouteSplit {
+  _RouteSplit(this.rest, this.room);
+
+  /// Finger movement not yet routed.
+  double rest;
+
+  /// How far the list can still scroll toward its top.
+  double room;
+
+  /// The part the list must apply.
+  double toList = 0.0;
+}
 
 /// Decides, delta by delta, whether the list, the refresh indicator or the
 /// sheet takes a drag. Pure state: no widgets, no side effects.
@@ -136,24 +58,7 @@ class RefreshSheetArbitrator {
   bool get armed => _armed;
   double get armDistance => _armDistance;
 
-  // Pointer samples.
-  int _pointers = 0;
-  int? _primary;
-  bool _multiTouch = false;
-  Duration _downTime = Duration.zero;
-  Offset _downLocal = Offset.zero;
-  VelocityTracker _tracker = VelocityTracker.withKind(PointerDeviceKind.touch);
-  Offset _last = Offset.zero;
-  Duration _lastTime = Duration.zero;
-  double _instantVy = 0.0;
-  int _lastStepSign = 0;
-  final List<Duration> _flips = <Duration>[];
-
-  // The current run: movement since the last reversal.
-  Offset _runStart = Offset.zero;
-  Offset _runExtreme = Offset.zero;
-  int _runDir = 0;
-  double _runPath = 0.0;
+  final PointerHistory _history = PointerHistory();
 
   // The current drag.
   bool _eligible = false;
@@ -161,6 +66,7 @@ class RefreshSheetArbitrator {
   bool _sheetEnabled = false;
   bool _topBand = false;
   bool _armed = false;
+  bool _cancelled = false;
   double _armDistance = 0.0;
   double _sheetHeight = 0.0;
 
@@ -170,72 +76,33 @@ class RefreshSheetArbitrator {
     Offset position,
     Offset local,
     PointerDeviceKind kind,
-  ) {
-    _pointers++;
-    if (_pointers > 1) {
-      _multiTouch = true; // freezes takeovers until every finger lifts
-      return;
-    }
-    _primary = pointer;
-    _multiTouch = false;
-    _downTime = time;
-    _downLocal = local;
-    _tracker = VelocityTracker.withKind(kind)..addPosition(time, position);
-    _last = position;
-    _lastTime = time;
-    _instantVy = 0.0;
-    _lastStepSign = 0;
-    _flips.clear();
-    _runStart = position;
-    _runExtreme = position;
-    _runDir = 0;
-    _runPath = 0.0;
-  }
+  ) => _history.down(pointer, time, position, local, kind);
 
-  void pointerMove(int pointer, Duration time, Offset position) {
-    if (pointer != _primary) return;
-    _tracker.addPosition(time, position);
-    final Offset step = position - _last;
-    final double dt =
-        (time - _lastTime).inMicroseconds / Duration.microsecondsPerSecond;
-    if (dt > 0) _instantVy = step.dy / dt;
+  void pointerMove(int pointer, Duration time, Offset position) =>
+      _history.move(
+        pointer,
+        time,
+        position,
+        reversalHysteresis: config.reversalHysteresis,
+      );
 
-    final int sign = step.dy.sign.toInt();
-    if (sign != 0) {
-      if (_lastStepSign != 0 && sign != _lastStepSign) _flips.add(time);
-      _lastStepSign = sign;
-    }
-    _flips.removeWhere((flip) => time - flip > _kVelocityWindow);
+  void pointerUp(int pointer) => _history.up(pointer);
 
-    if (_runDir == 0) {
-      _runDir = (position.dy - _runStart.dy).sign.toInt();
-      _runExtreme = position;
-      _runPath += step.distance;
-    } else if ((position.dy - _runExtreme.dy) * _runDir >= 0) {
-      _runExtreme = position;
-      _runPath += step.distance;
-    } else if ((_runExtreme.dy - position.dy) * _runDir >
-        config.reversalHysteresis) {
-      _runStart = _runExtreme;
-      _runExtreme = position;
-      _runDir = -_runDir;
-      _runPath = (position - _runStart).distance;
-    } else {
-      _runPath += step.distance;
-    }
-
-    _last = position;
-    _lastTime = time;
-  }
-
-  void pointerUp(int pointer) {
-    _pointers = math.max(0, _pointers - 1);
+  /// A cancelled pointer never refreshes and never closes. The scroll
+  /// recognizer reports an accepted drag's cancel as a normal end, so the
+  /// cancel must be recorded here.
+  void pointerCancel(int pointer) {
+    _cancelled = true;
+    _history.up(pointer);
   }
 
   /// Starts a scroll drag. [eligible] means the list was at rest at its top
   /// when the finger landed; an ineligible drag only ever scrolls the list.
+  /// [sheetEntering] means the sheet is off home because its entry animation
+  /// is still running, not because a drag left it there.
   void beginDrag({
     required bool eligible,
+    bool sheetEntering = false,
     required bool refreshing,
     required bool sheetEnabled,
     required double viewport,
@@ -247,20 +114,18 @@ class RefreshSheetArbitrator {
     _sheetEnabled = sheetEnabled && sheetHeight > 0.0;
     _armDistance = config.armDistanceFraction * viewport;
     _sheetHeight = sheetHeight;
-    _topBand = _downLocal.dy < config.topBandFraction * viewport;
+    _topBand = _history.downLocal.dy < config.topBandFraction * viewport;
     _armed = false;
+    _cancelled = false;
     pull = 0.0;
     this.sheetOffset = sheetOffset;
-    state = !eligible
-        ? ArbitrationState.list
-        : (sheetOffset > 0.0 && _sheetEnabled
-              ? ArbitrationState.sheet
-              : ArbitrationState.idle);
+    state = _initialState(sheetOffset, sheetEntering);
     _log(
       'begin: state=${state.name} eligible=$eligible refreshing=$refreshing '
       'sheetEnabled=$_sheetEnabled band=${_topBand ? 'top' : 'body'} '
-      'V=${viewport.toStringAsFixed(1)} H=${sheetHeight.toStringAsFixed(1)} '
-      'arm=${_armDistance.toStringAsFixed(1)}',
+      'V=${viewport.toStringAsFixed(logPixelDigits)} '
+      'H=${sheetHeight.toStringAsFixed(logPixelDigits)} '
+      'arm=${_armDistance.toStringAsFixed(logPixelDigits)}',
     );
   }
 
@@ -268,90 +133,22 @@ class RefreshSheetArbitrator {
   /// [room] is how far the list can still scroll toward its top. Updates
   /// [pull] and [sheetOffset], and returns the part the list must apply.
   double route(double delta, {required double room}) {
-    var rest = delta;
-    var toList = 0.0;
-    for (var hops = 0; rest != 0.0 && hops < 8; hops++) {
-      switch (state) {
-        case ArbitrationState.idle:
-          _enter(
-            rest > 0.0 && room <= config.edgeSlop
-                ? _topTarget()
-                : ArbitrationState.list,
-            'first delta',
-          );
-        case ArbitrationState.list:
-          if (rest < 0.0 || !_eligible) {
-            toList += rest;
-            room -= rest;
-            rest = 0.0;
-            break;
-          }
-          final double take = math.min(rest, math.max(0.0, room));
-          toList += take;
-          room -= take;
-          rest -= take;
-          if (rest > 0.0) {
-            final next = _topTarget();
-            if (next == ArbitrationState.list) {
-              toList += rest; // platform overscroll
-              rest = 0.0;
-            } else {
-              _enter(next, 'list reached its top');
-            }
-          }
-        case ArbitrationState.indicator:
-          if (rest > 0.0 && _dismissIntent()) {
-            _enter(ArbitrationState.sheet, 'dismiss intent');
-            break;
-          }
-          pull += rest;
-          rest = 0.0;
-          if (pull < 0.0) {
-            rest = pull;
-            pull = 0.0;
-            _enter(ArbitrationState.list, 'indicator unwound');
-          }
-          if (!_armed && pull >= _armDistance) {
-            _armed = true;
-            _log('armed at pull ${pull.toStringAsFixed(1)}');
-          } else if (_armed && pull < _armDistance - config.armHysteresis) {
-            _armed = false;
-            _log('disarmed at pull ${pull.toStringAsFixed(1)}');
-          }
-        case ArbitrationState.sheet:
-          sheetOffset = math.min(sheetOffset + rest, _sheetHeight);
-          rest = 0.0;
-          if (sheetOffset < 0.0) {
-            rest = sheetOffset;
-            sheetOffset = 0.0;
-            _enter(
-              _refreshing ? ArbitrationState.list : ArbitrationState.indicator,
-              'sheet home',
-            );
-          }
-      }
+    final _RouteSplit split = _RouteSplit(delta, room);
+    for (var hops = 0; split.rest != 0.0 && hops < _kMaxRouteHops; hops++) {
+      _routeStep(split);
     }
-    return toList;
+    return split.toList;
   }
 
   /// Commits whatever is tracking. [fingerVelocity] is px/s, positive down.
-  ArbitrationCommit release(double fingerVelocity, {bool cancelled = false}) {
-    final ArbitrationCommit commit = switch (state) {
-      ArbitrationState.idle || ArbitrationState.list => ArbitrationCommit.list,
-      ArbitrationState.indicator =>
-        _armed && !cancelled
-            ? ArbitrationCommit.refresh
-            : ArbitrationCommit.retract,
-      ArbitrationState.sheet =>
-        !cancelled &&
-                (fingerVelocity >= config.closeVelocity ||
-                    sheetOffset >= config.closeProgress * _sheetHeight)
-            ? ArbitrationCommit.close
-            : ArbitrationCommit.springBack,
-    };
+  ArbitrationCommit release(double fingerVelocity) {
+    final ArbitrationCommit commit = _commitFor(fingerVelocity);
     _log(
-      'release: ${state.name} -> ${commit.name} | v=${fingerVelocity.toStringAsFixed(1)} '
-      'pull=${pull.toStringAsFixed(1)} sheet=${sheetOffset.toStringAsFixed(1)} cancelled=$cancelled',
+      'release: ${state.name} -> ${commit.name} | '
+      'v=${fingerVelocity.toStringAsFixed(logPixelDigits)} '
+      'pull=${pull.toStringAsFixed(logPixelDigits)} '
+      'sheet=${sheetOffset.toStringAsFixed(logPixelDigits)} '
+      'cancelled=$_cancelled',
     );
     state = ArbitrationState.idle;
     return commit;
@@ -359,13 +156,135 @@ class RefreshSheetArbitrator {
 
   /// One line with every input the takeover decision reads.
   String describe() {
-    final Offset run = _last - _runStart;
-    return 't=${(_lastTime - _downTime).inMilliseconds}ms state=${state.name}${_armed ? '(armed)' : ''} pull=${pull.toStringAsFixed(1)} '
-        'sheet=${sheetOffset.toStringAsFixed(1)} vSmooth=${_smoothedVy.toStringAsFixed(0)} '
-        'vInst=${_instantVy.toStringAsFixed(0)} run=${run.dy.toStringAsFixed(1)}/${run.dx.toStringAsFixed(1)} '
-        'straight=${_straightness.toStringAsFixed(2)} flips=${_flips.length} '
-        'multi=$_multiTouch';
+    final Offset run = _history.run;
+    final int elapsedMs =
+        (_history.lastTime - _history.downTime).inMilliseconds;
+    return 't=${elapsedMs}ms state=${state.name}${_armed ? '(armed)' : ''} '
+        'pull=${pull.toStringAsFixed(logPixelDigits)} '
+        'sheet=${sheetOffset.toStringAsFixed(logPixelDigits)} '
+        'vSmooth=${_history.smoothedVy.toStringAsFixed(logSpeedDigits)} '
+        'vInst=${_history.instantVy.toStringAsFixed(logSpeedDigits)} '
+        'run=${run.dy.toStringAsFixed(logPixelDigits)}/'
+        '${run.dx.toStringAsFixed(logPixelDigits)} '
+        'straight=${_history.straightness.toStringAsFixed(logRatioDigits)} '
+        'flips=${_history.flipCount} multi=${_history.multiTouch}';
   }
+
+  ArbitrationState _initialState(double sheetOffset, bool sheetEntering) {
+    if (!_eligible) return ArbitrationState.list;
+    // Catching a sheet that is springing back keeps dragging it; catching the
+    // entry animation is a fresh pull, which must not move the sheet slowly.
+    return sheetOffset > 0.0 && _sheetEnabled && !sheetEntering
+        ? ArbitrationState.sheet
+        : ArbitrationState.idle;
+  }
+
+  void _routeStep(_RouteSplit split) {
+    switch (state) {
+      case ArbitrationState.idle:
+        _routeFromIdle(split);
+      case ArbitrationState.list:
+        _routeToList(split);
+      case ArbitrationState.indicator:
+        _routeToIndicator(split);
+      case ArbitrationState.sheet:
+        _routeToSheet(split);
+    }
+  }
+
+  /// The first delta of a drag picks its target.
+  void _routeFromIdle(_RouteSplit split) {
+    final bool atTop = split.room <= config.edgeSlop;
+    _enter(
+      split.rest > 0.0 && atTop ? _topTarget() : ArbitrationState.list,
+      'first delta',
+    );
+  }
+
+  /// The list scrolls while it can; past its top the remainder moves on.
+  void _routeToList(_RouteSplit split) {
+    if (split.rest < 0.0 || !_eligible) {
+      split.toList += split.rest;
+      split.room -= split.rest;
+      split.rest = 0.0;
+      return;
+    }
+    final double take = math.min(split.rest, math.max(0.0, split.room));
+    split.toList += take;
+    split.room -= take;
+    split.rest -= take;
+    if (split.rest > 0.0) _overflowFromList(split);
+  }
+
+  /// The list reached its top with finger movement left over.
+  void _overflowFromList(_RouteSplit split) {
+    final ArbitrationState next = _topTarget();
+    if (next == ArbitrationState.list) {
+      split.toList += split.rest; // platform overscroll
+      split.rest = 0.0;
+    } else {
+      _enter(next, 'list reached its top');
+    }
+  }
+
+  /// The indicator tracks the pull; a fast downward run hands it to the sheet.
+  void _routeToIndicator(_RouteSplit split) {
+    if (split.rest > 0.0 && _dismissIntent()) {
+      _enter(ArbitrationState.sheet, 'dismiss intent');
+      return;
+    }
+    pull += split.rest;
+    split.rest = 0.0;
+    if (pull < 0.0) {
+      split.rest = pull;
+      pull = 0.0;
+      _enter(ArbitrationState.list, 'indicator unwound');
+    }
+    _updateArmed();
+  }
+
+  /// Keeps [_armed] in step with the pull, with hysteresis on the way down.
+  void _updateArmed() {
+    if (!_armed && pull >= _armDistance) {
+      _armed = true;
+      _log('armed at pull ${pull.toStringAsFixed(logPixelDigits)}');
+    } else if (_armed && pull < _armDistance - config.armHysteresis) {
+      _armed = false;
+      _log('disarmed at pull ${pull.toStringAsFixed(logPixelDigits)}');
+    }
+  }
+
+  /// The sheet takes the delta up to its full height; past home it moves on.
+  void _routeToSheet(_RouteSplit split) {
+    sheetOffset = math.min(sheetOffset + split.rest, _sheetHeight);
+    split.rest = 0.0;
+    if (sheetOffset < 0.0) {
+      split.rest = sheetOffset;
+      sheetOffset = 0.0;
+      _enter(
+        _refreshing ? ArbitrationState.list : ArbitrationState.indicator,
+        'sheet home',
+      );
+    }
+  }
+
+  ArbitrationCommit _commitFor(double fingerVelocity) {
+    return switch (state) {
+      ArbitrationState.idle || ArbitrationState.list => ArbitrationCommit.list,
+      ArbitrationState.indicator =>
+        _armed && !_cancelled
+            ? ArbitrationCommit.refresh
+            : ArbitrationCommit.retract,
+      ArbitrationState.sheet =>
+        !_cancelled && _sheetCloses(fingerVelocity)
+            ? ArbitrationCommit.close
+            : ArbitrationCommit.springBack,
+    };
+  }
+
+  bool _sheetCloses(double fingerVelocity) =>
+      fingerVelocity >= config.closeVelocity ||
+      sheetOffset >= config.closeProgress * _sheetHeight;
 
   ArbitrationState _topTarget() {
     if (!_refreshing) return ArbitrationState.indicator;
@@ -377,35 +296,37 @@ class RefreshSheetArbitrator {
     state = next;
   }
 
-  double get _smoothedVy =>
-      _tracker.getVelocityEstimate()?.pixelsPerSecond.dy ?? 0.0;
-
-  double get _straightness =>
-      _runPath == 0.0 ? 1.0 : (_last - _runStart).distance / _runPath;
-
+  /// A fast, straight downward run from an indicator pull hands it to the
+  /// sheet.
   bool _dismissIntent() {
     // Armed, or tracked past the deadline, means committed to the indicator.
     final bool committed =
-        _armed || _lastTime - _downTime > config.takeoverDeadline;
+        _armed ||
+        _history.lastTime - _history.downTime > config.takeoverDeadline;
     if (!_sheetEnabled ||
         (committed && !config.refreshCanBecomeDismiss) ||
-        _multiTouch ||
-        _runDir <= 0) {
+        _history.multiTouch ||
+        _history.runDir <= 0) {
       return false;
     }
-    final Offset run = _last - _runStart;
-    final bool vertical =
-        run.dy.abs() >= config.axisDominance * run.dx.abs() &&
-        _straightness >= config.minStraightness;
-    if (!vertical) return false;
+    return _isVerticalRun() && _passesVelocityGate();
+  }
+
+  bool _isVerticalRun() {
+    final Offset run = _history.run;
+    return run.dy.abs() >= config.axisDominance * run.dx.abs() &&
+        _history.straightness >= config.minStraightness;
+  }
+
+  bool _passesVelocityGate() {
     final double gate = _topBand
         ? config.dismissVelocityTop
         : config.dismissVelocityBody;
-    return _lastTime - _downTime >= config.velocityHoldOff &&
-        run.dy >= config.minRunForVelocity &&
-        _flips.length < config.jitterFlips &&
-        _smoothedVy >= gate &&
-        _instantVy >= config.instantVelocityFactor * gate;
+    return _history.lastTime - _history.downTime >= config.velocityHoldOff &&
+        _history.run.dy >= config.minRunForVelocity &&
+        _history.flipCount < config.jitterFlips &&
+        _history.smoothedVy >= gate &&
+        _history.instantVy >= config.instantVelocityFactor * gate;
   }
 
   void _log(String message) => onLog?.call(message);

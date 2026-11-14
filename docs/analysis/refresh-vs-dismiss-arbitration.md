@@ -1,18 +1,20 @@
 # Pull-to-refresh versus drag-to-dismiss in a modal bottom sheet: design plan
 
-Status: design only. Nothing in `lib/`, `example/` or `test/` has changed.
+Status: slices 1, 2 and 3 are implemented. Section 9 lists what the implementation changed against this plan. Where the two disagree, section 9 and the code win. The experiments in section 7 have not been run.
 
-SDK the repo resolves: Flutter 3.47.9 (framework `c197ca5199`, Dart 3.13.7), from `.dart_tool/package_config.json`.
-Every `file:line` below is in `packages/flutter/lib/src/` of that SDK and was read for this plan.
+SDK the repo resolves: Flutter 3.50.0 (framework `ab2912035e`, Dart 3.14.0), from `.fvmrc`.
+Every `file:line` below is in `packages/flutter/lib/src/` of that SDK and was rechecked against it.
 Line numbers will drift on other versions; the symbol names are the stable reference.
+`package:flutter/material.dart` and `package:flutter/cupertino.dart` are deprecated in this SDK. The package and the example import `material_ui` and `cupertino_ui`. The framework files cited here still live under `packages/flutter/lib/src/`.
 
 ## Decision summary
 
 1. The scrollable keeps the pointer. The package diverts its drag deltas, one pointer move at a time, to exactly one of three targets: the list, the refresh indicator, or the sheet.
-2. The diversion point is `ScrollPosition.applyUserOffset` and `goBallistic`, through a package-owned `ScrollController`. The framework's own Cupertino sheet uses this same seam (`cupertino/sheet.dart:1202`, `_CupertinoSheetScrollPosition`).
+2. The diversion point is `ScrollPosition.applyUserOffset` and `goBallistic`, through a package-owned `ScrollController`. The framework's own Cupertino sheet uses this same seam (`cupertino/sheet.dart:1200`, `_CupertinoSheetScrollPosition`).
 3. The sheet is moved through the route's own `AnimationController`, with the same formula the stock handler uses. Reaching that controller needs a three-line `ModalBottomSheetRoute` subclass. No custom sheet widget, no copied framework code.
 4. `RefreshIndicatorOpt` stops delegating to `RefreshIndicator` when it is inside that route and runs its own indicator state, because a stock `RefreshIndicator` cannot be cancelled from outside once it is armed (section 3.3). Outside the route it stays the pass-through it is today.
 5. A pure-Dart arbitrator decides the target on every pointer move from the inputs in section 5. All thresholds live in one config object.
+6. `refreshCanBecomeDismiss` defaults to true: a fast pull hands the sheet over even after the indicator arms or `takeoverDeadline` passes. Set it false and a tracked pull stays a pull; the sheet can take over only with a fast pull, within `takeoverDeadline` of pointer down and before the indicator arms (section 9).
 
 ## 1. Failure
 
@@ -21,14 +23,14 @@ Line numbers will drift on other versions; the symbol names are the stable refer
 ```
 showModalBottomSheet(enableDrag: true, isScrollControlled: false, no drag handle)
 └─ ModalBottomSheetRoute
-   └─ _ModalBottomSheet                       material/bottom_sheet.dart:653
+   └─ _ModalBottomSheet                       material/bottom_sheet.dart:651
       └─ _BottomSheetLayoutWithSizeListener   caps height at 9/16 (line 621)
          └─ BottomSheet
-            └─ _BottomSheetGestureDetector    VerticalDragGestureRecognizer A (line 1440)
+               └─ _BottomSheetGestureDetector    VerticalDragGestureRecognizer A (line 1437)
                └─ Material
                   └─ RefreshIndicatorOpt → RefreshIndicator
                      └─ ListView.builder (30 rows, AlwaysScrollableScrollPhysics)
-                        └─ Scrollable         VerticalDragGestureRecognizer B (widgets/scrollable.dart:790)
+                        └─ Scrollable         VerticalDragGestureRecognizer B (widgets/scrollable.dart:791)
 ```
 
 The list fills the sheet. Every pointer that lands on the sheet lands on the `Scrollable`.
@@ -46,7 +48,7 @@ Result:
 | Downward drag on the list | B wins. On Android the list emits `OverscrollNotification`; on iOS it bounces. `RefreshIndicator` displaces and may arm. The sheet never moves. |
 | Downward drag on a non-scrolling region | A wins and the sheet tracks the finger. The example has no such region. |
 
-`AlwaysScrollableScrollPhysics.shouldAcceptUserOffset` returns `true` unconditionally (`widgets/scroll_physics.dart:959`), so B is in the arena even when the content is shorter than the sheet.
+`AlwaysScrollableScrollPhysics.shouldAcceptUserOffset` returns `true` unconditionally (`widgets/scroll_physics.dart:1086`), so B is in the arena even when the content is shorter than the sheet.
 
 ## 2. Prior reports
 
@@ -62,7 +64,7 @@ Eight of the nine links were fetched on 2026-11-13. Stack Overflow refused the f
 
 **flutter/flutter#116427** (closed as a duplicate). A fast flick on a `DraggableScrollableSheet` inside `showModalBottomSheet` snaps the sheet and stops scrolling the inner list, and the reporter asks why there is no dismiss threshold. A triager could not confirm the flick problem on master. Not this fix: it shows that sharing one position between extent and list gives the app no say in when a flick becomes a dismiss.
 
-**flutter/flutter#95673 and #127236.** #95673 (closed as a duplicate of #83273) reports that `enableDrag: false` is ignored once a `DraggableScrollableSheet` is the child. #127236 proposed `shouldCloseOnMinExtent`, closed by PR #127339. Both are confirmed in the pinned SDK: `_BottomSheetState.extentChanged` (`material/bottom_sheet.dart:325`) calls `onClosing` when a `DraggableScrollableNotification` reports `extent == minExtent`, without consulting `enableDrag`. Not this fix: the close is a binary event at min extent. It says nothing while the finger is moving.
+**flutter/flutter#95673 and #127236.** #95673 (closed as a duplicate of #83273) reports that `enableDrag: false` is ignored once a `DraggableScrollableSheet` is the child. #127236 proposed `shouldCloseOnMinExtent`, closed by PR #127339. Both are confirmed in the pinned SDK: `_BottomSheetState.extentChanged` (`material/bottom_sheet.dart:327`) calls `onClosing` when a `DraggableScrollableNotification` reports `extent == minExtent` and `shouldCloseOnMinExtent`, without consulting `enableDrag`. Not this fix: the close is a binary event at min extent. It says nothing while the finger is moving.
 
 **Stack Overflow 57835416** (not fetched; unverified). Per the task brief: dragging the list only scrolls it, and the sheet moves only from a non-scrolling handle. That is the arena result in section 1. Not this fix: a handle is a second affordance, not an answer for the list area.
 
@@ -77,13 +79,13 @@ Eight of the nine links were fetched on 2026-11-13. Stack Overflow refused the f
 | Fact | Where |
 |---|---|
 | `_kMinFlingVelocity = 700.0`, `_kCloseProgressThreshold = 0.5`, default height ratio `9.0 / 16.0` | `material/bottom_sheet.dart:30-32` |
-| The drag moves the sheet with `animationController.value -= primaryDelta / _childHeight` | `_handleDragUpdate`, line 285 |
-| On release: close if `velocity.dy > 700`, else close if `value < 0.5`, else `forward()` | `_handleDragEnd`, lines 301-321 |
-| The recognizer is built privately, with `onlyAcceptDragOnThreshold = true` | `_BottomSheetGestureDetector`, lines 1440-1466 |
-| The route keeps its controller in a private field | `ModalBottomSheetRoute._animationController`, line 1111 |
-| Height cap when `isScrollControlled` is false | `_getConstraintsForChild`, lines 617-624 |
-| Sheet position is `size.height - childSize.height * animationValue` | `_getPositionForChild`, line 627 |
-| `animationValue` is the route animation passed through a curve, except during a stock drag, when `handleDragStart` rebinds it to the linear animation | `_ModalBottomSheetState`, lines 690-745 |
+| The drag moves the sheet with `animationController.value -= primaryDelta / _childHeight` | `_handleDragUpdate`, line 278 |
+| On release: close if `velocity.dy > 700`, else close if `value < 0.5`, else `forward()` | `_handleDragEnd`, lines 303-318 |
+| The recognizer is built privately, with `onlyAcceptDragOnThreshold = true` | `_BottomSheetGestureDetector`, lines 1437-1468 |
+| The route keeps its controller in a private field | `ModalBottomSheetRoute._animationController`, line 1108 |
+| Height cap when `isScrollControlled` is false | `_getConstraintsForChild`, lines 615-623 |
+| Sheet position is `size.height - childSize.height * animationValue` | `_getPositionForChild`, line 625 |
+| `animationValue` is the route animation passed through a curve, except during a stock drag, when `handleDragStart` rebinds it to the linear animation | `_ModalBottomSheetState`, lines 689-749 |
 
 **The stock drag handler cannot be fed pixels from outside.** `_handleDragStart`, `_handleDragUpdate` and `_handleDragEnd` are private methods of a private state class. The recognizer that calls them is created inside a private widget. The only public inputs are `enableDrag`, `showDragHandle` and the observer callbacks `onDragStart` / `onDragEnd`. And because arena resolution is final per pointer, making recognizer A win would give the sheet the whole gesture, with no way to hand the pointer to the indicator or the list afterwards.
 
@@ -96,8 +98,8 @@ What is public: `TransitionRoute.controller` (`widgets/routes.dart:191`), marked
 | Every drag delta goes through `applyUserOffset`, which calls `setPixels(pixels - physics.applyPhysicsToUserOffset(this, delta))` | `widgets/scroll_position_with_single_context.dart:129-132` |
 | Pointer up calls `goBallistic(velocity)`, which asks the physics for a simulation | same file, lines 149-157 |
 | Mouse wheel uses `pointerScroll`, a separate path | same file, line 210 |
-| `BouncingScrollPhysics.applyPhysicsToUserOffset` applies friction when out of range and does not consult its parent | `widgets/scroll_physics.dart:713` |
-| `ClampingScrollPhysics.createBallisticSimulation` returns `null` at the leading edge when velocity points out of range | `widgets/scroll_physics.dart:895` onward |
+| `BouncingScrollPhysics.applyPhysicsToUserOffset` applies friction when out of range and does not consult its parent | `widgets/scroll_physics.dart:835` |
+| `ClampingScrollPhysics.createBallisticSimulation` returns `null` at the leading edge when velocity points out of range | `widgets/scroll_physics.dart:1021` onward |
 | Platform default physics: bouncing on iOS and macOS, clamping elsewhere | `widgets/scroll_configuration.dart:243-257` |
 | Render-object listeners see a pointer event before recognizers do, because the binding adds itself last to the hit-test path and routes to recognizers from its own `handleEvent` | `gestures/binding.dart:455`, `537-538` |
 
@@ -116,12 +118,12 @@ The brief says the indicator "arms after the overscroll exceeds `_kDragContainer
 
 ### 3.4 Framework precedent for mid-gesture handoff
 
-`_CupertinoSheetScrollPosition` (`cupertino/sheet.dart:1202-1296`) extends `ScrollPositionWithSingleContext` and overrides two methods:
+`_CupertinoSheetScrollPosition` (`cupertino/sheet.dart:1200-1294`) extends `ScrollPositionWithSingleContext` and overrides two methods:
 
-- `applyUserOffset(delta)`: if the list is at the top and the delta is downward, or the sheet is already dragged down, the delta goes to the sheet; otherwise to `super` (lines 1259-1267).
-- `goBallistic(velocity)`: ends the sheet drag and calls `super.goBallistic(0)` when the sheet owned the gesture, so the list does not also fling (lines 1269-1288).
+- `applyUserOffset(delta)`: if the list is at the top and the delta is downward, or the sheet is already dragged down, the delta goes to the sheet; otherwise to `super` (lines 1258-1265).
+- `goBallistic(velocity)`: ends the sheet drag and calls `super.goBallistic(0)` when the sheet owned the gesture, so the list does not also fling (lines 1268-1286).
 
-It is created by `_CupertinoSheetScrollController.createScrollPosition` (line 1176) and handed to the app through `scrollableBuilder`. Its header comment says it is itself a modified copy of the position inside `DraggableScrollableSheet`. So the framework has done this twice, both times through the scroll position, never through the arena.
+It is created by `_CupertinoSheetScrollController.createScrollPosition` (line 1174) and handed to the app through `scrollableBuilder`. Its header comment says it is itself a modified copy of the position inside `DraggableScrollableSheet`. So the framework has done this twice, both times through the scroll position, never through the arena.
 
 ### 3.5 Stay on the 9/16 default, or move to a scroll-controlled sheet
 
@@ -139,7 +141,7 @@ What it changes for this design is scale. Sheet height sets how many pixels 50% 
 
 **`enableDrag: false`, or removing the indicator.** Each removes one of the two gestures the user asked to keep.
 
-**`DraggableScrollableSheet` with min and max at 1.** One shared position, pinned at full extent, means the first downward pixel is a move toward min extent, and min extent closes the sheet (`extentChanged`, line 325). There is no state in which the indicator can own the pull.
+**`DraggableScrollableSheet` with min and max at 1.** One shared position, pinned at full extent, means the first downward pixel is a move toward min extent, and min extent closes the sheet (`extentChanged`, line 327). There is no state in which the indicator can own the pull.
 
 **Forcing `ClampingScrollPhysics`.** Its only purpose in the #36283 patch is to make an overscroll notification appear on iOS. It changes how the list feels everywhere, to feed a design that still pops late.
 
@@ -185,7 +187,7 @@ All are sampled on every pointer move unless marked as captured at pointer down.
 | Instantaneous velocity, last sample `dy / dt` | `Listener` | rejects a stale smoothed estimate when the finger is already slowing |
 | Reversals: sign changes of `dy` that exceed `reversalHysteresis` | `Listener` | starts a new run, drives hand-back |
 | Jitter: sign changes below the hysteresis within the velocity window | `Listener` | if high, the velocity gate is ignored and only the distance gate applies |
-| Time since pointer down; time since arming | event timestamps | velocity hold-off, armed dwell lock |
+| Time since pointer down | event timestamps | velocity hold-off, takeover deadline |
 | Pixels the list can still consume before min and max extent | scroll metrics | whether a delta is "into the list" |
 | Current owner and current sheet offset | arbitrator state | hand-back without a new gesture |
 | Refresh in flight | indicator state | section 5.6 |
@@ -203,16 +205,17 @@ One immutable `RefreshSheetArbitrationConfig`. No threshold appears as a literal
 | `minStraightness` | 0.85 | hypothesis |
 | `reversalHysteresis` | 8 px | hypothesis |
 | `velocityHoldOff` | 40 ms | the tracker needs three samples |
+| `takeoverDeadline` | 200 ms after pointer down | hypothesis; a dismiss flick moves right after the finger lands, a refresh pull is tracked for longer |
+| `refreshCanBecomeDismiss` | true | product choice; false keeps a tracked pull on the indicator after arming or after the deadline |
 | `minRunForVelocity` | 32 px | keeps the velocity gate off slop noise |
 | `dismissVelocityTop` | 1100 px/s | hypothesis. Stock 700 is a release-time gate; a mid-gesture gate must sit above the peak speed of an ordinary refresh pull |
 | `dismissVelocityBody` | 800 px/s | hypothesis |
 | `armDistance` | 0.25 of `V` | mirrors `_kDragContainerExtentPercentage` |
 | `armHysteresis` | 12 px | hypothesis |
-| `indicatorTravelLimit` | 1.5 × `displacement` | mirrors `_kDragSizeFactorLimit` |
-| `dismissDistanceTop` | 1.5 × `armDistance` | hypothesis; leaves a release window after arming |
-| `dismissDistanceBody` | 1.2 × `armDistance` | hypothesis |
-| `armedDwellLock` | 250 ms below 100 px/s | hypothesis; keeps the lift-off flick from turning a refresh into a dismiss |
-| `reentryHysteresis` | 24 px | hypothesis |
+| `indicatorTravelFactor` | 1.5 | mirrors `_kDragSizeFactorLimit` |
+| `instantVelocityFactor` | 0.5 | the instantaneous-velocity check in 5.5 |
+| `jitterFlips` | 2 direction flips within 100 ms | hypothesis |
+| `snapDuration`, `retractDuration` | 150 ms, 200 ms | stock `_kIndicatorSnapDuration`, `_kIndicatorScaleDuration` |
 | `closeVelocity` | 700 px/s | mirrors `_kMinFlingVelocity` |
 | `closeProgress` | 0.5 of `H` | mirrors `_kCloseProgressThreshold` |
 
@@ -244,11 +247,12 @@ fast      = time since down >= velocityHoldOff
             and jitter is low
             and smoothed velocity >= dismissVelocity(band)
             and instantaneous velocity >= 0.5 * dismissVelocity(band)
-long      = pull >= dismissDistance(band), plus reentryHysteresis if the sheet already handed back once
-dismissIntent = vertical and (fast or long) and not dwellLocked and route.enableDrag
+committed = armed or time since down > takeoverDeadline
+dismissIntent = vertical and fast and route.enableDrag and one pointer
+                and (not committed or refreshCanBecomeDismiss)
 ```
 
-`dwellLocked` becomes true once the indicator has been `armed` for `armedDwellLock` with the finger nearly still.
+There is no distance gate. A slow pull never moves the sheet, however long it is. The plan first had one (`dismissDistance`, at 1.5 × `armDistance`), together with an armed dwell lock to stop lift-off flicks. Device testing showed that a pull which turns fast after the indicator is visible must stay a pull (section 9), and the distance gate could only fire after arming. Both were removed.
 
 | From | To | Condition | On screen |
 |---|---|---|---|
@@ -260,7 +264,7 @@ dismissIntent = vertical and (fast or long) and not dwellLocked and route.enable
 | `indicator.armed` | `indicator.pulling` | `pull < armDistance - armHysteresis` | spinner fades with pull |
 | `indicator` | `list` | upward deltas have brought `pull` to 0 and delta remains | indicator gone; the remainder scrolls the list |
 | `list` | `indicator` | eligible gesture only: the list is back at min extent and the delta is downward | indicator from pull 0 |
-| `sheet` | `indicator` | upward deltas have brought `sheetOffset` to 0 and delta remains, no refresh in flight | sheet fully open; indicator reappears at the `pull` it had at takeover and shrinks with the finger |
+| `sheet` | `indicator` | upward deltas have brought `sheetOffset` to 0 and delta remains, no refresh in flight | sheet fully open; indicator reappears at the `pull` it had at takeover and shrinks with the finger. A second takeover is subject to the same deadline, so in practice it does not happen |
 | `sheet` | `list` | same, with a refresh in flight | the remainder scrolls the list |
 
 Notes:
@@ -313,15 +317,15 @@ const RefreshIndicatorOpt({
 Build logic:
 
 - `ModalRoute.of(context)` is not a `RefreshSheetRoute`: build a stock `RefreshIndicator`, exactly as today. The existing test keeps passing.
-- It is one: build `Listener` → `PrimaryScrollController(controller: package controller)` → own indicator overlay (`RefreshProgressIndicator`, public) → `child`.
+- It is one: build `Listener` → `PrimaryScrollController(controller: package controller)` → own indicator overlay (`RefreshProgressIndicator`, or `CupertinoActivityIndicator` on iOS) → `child`.
 
 The child's vertical scroll view picks the controller up through `PrimaryScrollController`, which is automatic on mobile platforms (`widgets/primary_scroll_controller.dart:39-65`); the package passes all platforms to `automaticallyInheritForPlatforms`. The example's `ListView.builder` needs no change.
 
-Internal, not exported:
+Internal, not exported (as built):
 
-- `_ArbitratedScrollController` / `_ArbitratedScrollPosition`: overrides `applyUserOffset`, `goBallistic`, and user-offset acceptance at the edge.
-- `RefreshSheetArbitrator`: pure Dart. `pointerDown(sample, metrics)`, `pointerMove(sample)`, `double route(delta, metrics)`, `Commit release(velocity)`, `cancel()`. Exposed to tests with `@visibleForTesting`.
-- Indicator state: about the size of the stock drag-phase code. Position, opacity and scale follow `pull`; snap, refresh and done reuse the stock durations as config values.
+- `SheetScrollController` / `_SheetScrollPosition` in `lib/src/sheet_scroll.dart`. They override `hold` (records whether the list was at rest), `drag` (eligibility and `beginDrag`), `applyUserOffset` and `goBallistic`. The physics is wrapped in `AlwaysScrollableScrollPhysics` for user-offset acceptance at the edge.
+- `RefreshSheetArbitrator` in `lib/src/arbitration.dart`: `pointerDown(pointer, time, position, local, kind)`, `pointerMove(pointer, time, position)`, `pointerUp(pointer)`, `pointerCancel(pointer)`, `beginDrag(...)`, `double route(delta, room:)`, `ArbitrationCommit release(velocity)`. Tests import it from `src/`. It is not marked `@visibleForTesting`.
+- Indicator: an `AnimationController` whose value is `pull / armDistance`. It is drawn with the stock geometry and clipped to the list area below `edgeOffset`. There is no scale-down "done" animation; it retracts by translation instead.
 
 ### 6.2 `RefreshSheetRoute`
 
@@ -340,7 +344,7 @@ One more override is needed for exact tracking. Between drags, the stock sheet p
 - pass `sheetAnimationStyle` with linear `curve` and `reverseCurve` to `super`, so sheet position is always linear in the controller value and the stock `Split` rebinding becomes the identity;
 - override `createSimulation({required bool forward})` (`widgets/routes.dart:272`) to return a simulation that follows the easing curve over the stock durations, so entry and exit look as they do today.
 
-A `showRefreshModalBottomSheet` function mirroring `showModalBottomSheet` is a convenience to add after the first slice; until then the example pushes the route directly.
+`showRefreshModalBottomSheet` mirrors the core of `showModalBottomSheet`. It takes `isScrollControlled`, `enableDrag`, `showDragHandle` and `useRootNavigator`; other parameters can be added when needed.
 
 ### 6.3 What stock `showModalBottomSheet` cannot do
 
@@ -368,10 +372,10 @@ Each is run on one Android and one iOS device, default sheet first.
 | E1 | Does a velocity gate separate refresh pulls from dismiss pulls? | 30 intended refreshes and 30 intended dismisses per tester, from the top band. Compare peak smoothed velocity before the arm distance. | The two distributions overlap so much that no threshold gets both error rates under 10%. Then velocity alone is not a usable gate and the distance gate must lead. |
 | E2 | Is `dismissVelocityTop` at 1100 right? | Same data. | More than 1 in 10 intended refreshes moves the sheet, or more than 1 in 10 intended fast dismisses arms the indicator first. Move it to the crossover point from E1. |
 | E3 | Does the pointer-down band carry information? | Repeat E1 from the body. Compare misclassification with band-specific thresholds against one shared set. | The difference is under 5 points. Then remove the band and keep one set. |
-| E4 | Is there a usable release window between arming and the long-pull takeover? | Slow pulls; testers release when the spinner looks ready. Record `pull` at release. | More than 1 in 10 releases happens after takeover. Raise `dismissDistance`, or drop the distance gate for the top band. |
+| E4 | Is `takeoverDeadline` at 200 ms right? | Intended fast dismisses, including ones where the finger rests briefly first. Record `t=` at the takeover line. | More than 1 in 10 intended dismisses gets no takeover because `t` was past the deadline, or more than 1 in 10 intended refreshes is taken over. |
 | E5 | Can a slow drag reach `closeProgress` on a 9/16 sheet? | Slow drag from the bottom of the top band until the finger reaches the screen edge. | The sheet cannot reach 50% before the finger runs out of screen. Lower `closeProgress` for this route; 0.35 is the next value to try. |
-| E6 | Does the dwell lock stop lift-off flicks? | Arm, hold, lift quickly. 30 trials. | Any trial moves the sheet. Lengthen the lock or lower its speed limit. |
-| E7 | Does hand-back feel continuous? | Pull into `sheet`, reverse to the start, continue upward. | The indicator visibly pops when it reappears, or the sheet re-triggers within `reentryHysteresis`. |
+| E6 | Does the arming lock (section 9, change 1) stop lift-off flicks? | Arm, hold, lift quickly. 30 trials. | Any trial moves the sheet. |
+| E7 | Does hand-back feel continuous? | Pull into `sheet`, reverse to the start, continue upward. | The indicator visibly pops when it reappears. |
 | E8 | Do fractions of `V` and `H` transfer? | Repeat E1, E4 and E5 on the full-height sheet. | Error rates differ by more than 5 points. Then use absolute pixels with a cap. |
 
 ### 7.3 Manual test matrix
@@ -382,7 +386,7 @@ Run every row on iOS physics and Android physics.
 |---|---|---|---|
 | 1 | Soft, short pull from the top band, list at top | Indicator displaces. Sheet and list do not move. | Released past the arm distance: `onRefresh` runs. Released before: indicator retracts. Sheet stays open either way. |
 | 2 | Fast downward pull from the top band | Indicator barely appears and retracts. Sheet follows the finger. | Fast release, or past half the sheet: closes. Otherwise springs back. No refresh. |
-| 3 | Slow, long downward pull | Indicator, then armed, then the sheet takes over and follows. | As row 2. No refresh. |
+| 3 | Slow, long downward pull, or a slow pull that turns fast | Indicator, then armed. The sheet does not move. | `onRefresh` runs. With `refreshCanBecomeDismiss`, a fast turn hands over to the sheet as in row 2. |
 | 4 | Drag that starts mid-list, either direction | List scrolls only. At the top: platform overscroll, no indicator, no sheet movement. | Stock fling. |
 | 5 | Upward fling, lift, list arrives at offset 0 | iOS bounces, Android clamps. Sheet still. Indicator hidden. | Nothing. |
 | 6 | Touch the list while it is still moving from row 5 | List only. | Stock fling. |
@@ -426,3 +430,38 @@ Goal: prove the two seams, with no policy.
 That slice already satisfies matrix rows 4, 5, 6 and the sheet half of 2 and 7.
 
 Slice 2 adds the package-owned indicator and the full arbitrator with the config object, plus unit tests that replay recorded sample traces through `RefreshSheetArbitrator`. Slice 3 adds the overlay and sliders and runs E1 to E8.
+
+New open question from slice 2:
+
+10. **Slow dismiss.** With the deadline and the armed lock, only a fast pull can drag the sheet from the list. Slow users can close it with a scrim tap, system back, or the drag handle. Is that enough, or does a slow dismiss need its own affordance?
+
+## 9. Implementation record
+
+### What is built
+
+| Slice | Contents | Tests |
+|---|---|---|
+| 1 | `RefreshSheetRoute` (linear controller plus `createSimulation`), `SheetScrollController` and position, the two-target rule, `showRefreshModalBottomSheet` | replaced by slice 2's widget tests |
+| 2 | Package-owned indicator, `RefreshSheetArbitrator`, `RefreshSheetArbitrationConfig`, `[RSheet]` debug logs (`debugRefreshSheetLogs`) | `test/arbitrator_test.dart` (trace replays), `test/refresh_indicator_bottom_sheet_test.dart` (widget tests under Android and iOS physics) |
+| 3 | Example app tuning screen: sheet variants (9/16 or scroll-controlled, 30 or 3 rows, drag handle, `enableDrag`), platform physics override, sliders for the hypothesis parameters, a live overlay of the arbitrator state, and per-gesture labels with copy-to-clipboard for the experiments | none; example only |
+
+### Changes against the plan
+
+1. **Arming locks the gesture to the indicator.** Device report: a slow pull past the arm distance that then sped up dismissed the sheet. Fix: an armed indicator never hands over.
+2. **Takeover deadline.** A second device trace showed the same problem before arming: a slow pull to 74.8 px of a 122.9 px arm distance, then a flick, moved the sheet. Fix: no takeover after `takeoverDeadline` (200 ms) from pointer down.
+3. **Distance gate, dwell lock and re-entry hysteresis removed.** After 1 and 2 they could no longer fire. `dismissDistanceTop`, `dismissDistanceBody`, `armedDwellLock`, `dwellSpeed` and `reentryHysteresis` are gone from the config.
+4. **`refreshCanBecomeDismiss`** (default true) lifts the lock from 1 and 2 so a refresh can turn into a dismiss. With it on, the risk the dwell lock covered comes back: a lift-off flick after arming can close the sheet. Set it false to keep that lock.
+5. **Config fields the plan left implicit:** `instantVelocityFactor`, `jitterFlips`, `snapDuration`, `retractDuration`.
+6. **Eligibility is decided at drag start**, in `_SheetScrollPosition.drag`, not at pointer down. The position's `hold` records whether the list was at rest when the finger landed.
+7. **The indicator is clipped** to the list area. It slides in from above, and without a clip it painted over the sheet's rounded top edge.
+8. **iOS touch slop.** On iOS about 29 px of a slow drag goes to touch slop and the bouncing physics' motion threshold before the indicator moves. The arm distance is therefore further away in finger travel on iOS than on Android.
+9. **iOS spinner.** On iOS the indicator is a `CupertinoActivityIndicator` (partially revealed while pulling, spinning while `onRefresh` runs), inside and outside the route. Other platforms keep `RefreshProgressIndicator`.
+10. **Review fixes.**
+    - A pointer cancel is recorded by the arbitrator from the `Listener`, because the scroll recognizer reports an accepted drag's cancel as a normal end.
+    - While the route pops, the sheet's controller is never written (stock `_dismissUnderway`).
+    - A close when the route is not current springs the sheet back.
+    - Reversed lists and mouse drags are ineligible.
+    - A drag that catches the entry animation starts idle, not in `sheet`; only a drag that catches a spring-back keeps the sheet.
+    - `debugRefreshSheetLogs` defaults to false.
+11. **Not done:** `triggerMode` and `notificationPredicate` are ignored inside the route (open questions 5 and 7), and the stock indicator's scale-down "done" animation is not reproduced.
+12. **Flutter 3.50.** The repo pins Flutter 3.50.0 (Dart 3.14.0). The package and the example import `material_ui` and `cupertino_ui` instead of the deprecated `package:flutter/material.dart` and `package:flutter/cupertino.dart` libraries. The example Android project uses the 3.50 template toolchain: Gradle 9.5.0, Android Gradle Plugin 9.3.1, Kotlin 2.4.20.
